@@ -6,10 +6,11 @@
 import torch.nn as nn
 import torch
 import torch.nn.functional as F
+import gc
 
 
 # this function construct an additive pot quantization levels set, with clipping threshold = 1,
-def build_power_value(B=2, additive=True):
+def build_power_value(B=2, additive=False):
     base_a = [0.]
     base_b = [0.]
     base_c = [0.]
@@ -65,6 +66,7 @@ def gradient_scale(x, scale):
 
 
 def apot_quantization(tensor, alpha, proj_set, is_weight=True, grad_scale=None):
+    
     def power_quant(x, value_s):
         if is_weight:
             shape = x.shape
@@ -88,16 +90,83 @@ def apot_quantization(tensor, alpha, proj_set, is_weight=True, grad_scale=None):
 
     if grad_scale:
         alpha = gradient_scale(alpha, grad_scale)
+    
+    
+    # print(f"tensor device: {tensor.get_device()}")
+    # print(f"alpha device: {alpha.get_device()}")
     data = tensor / alpha
+
     if is_weight:
         data = data.clamp(-1, 1)
         data_q = power_quant(data, proj_set)
         data_q = data_q * alpha
+
+
     else:
         data = data.clamp(0, 1)
         data_q = power_quant(data, proj_set)
         data_q = data_q * alpha
     return data_q
+
+
+
+
+##########################################################################################################
+
+# Weight 분할, 결합을 통한  Filter Wise Quantization 구현을 위해
+# 입력받은 perc에 따라 Quantize 되거나, 되지않는 Filter들의 Weight Tensor 1d Index 분류
+
+
+
+def sort_qscheme(tensor1, coef):  ### index는 tensor로 나타냄 (수정후)
+    # print(f"sort_qscheme input tensor shape: {tensor1.shape}")
+    th = coef * ( torch.max(torch.std(tensor1, (1, 2, 3))).item() - torch.min(torch.std(tensor1, (1, 2, 3))).item()) + torch.min(torch.std(tensor1, (1, 2, 3))).item()
+    qs1id = (torch.std(tensor1, (1, 2, 3)) > th).nonzero().view(-1)
+    qs2id = (torch.std(tensor1, (1, 2, 3)) <=th).nonzero().view(-1)
+
+    # print(f"qs1id: {qs1id}, qs1id shape: {qs1id.shape}")
+    # print(f"qs2id: {qs2id}, qs2id shape: {qs2id.shape}")
+
+    return qs1id , qs2id
+
+
+def sep_wt_mod(tensor1, coef):   # for문 없애고
+
+    # b_ind1 = sort_qscheme(tensor1, coef)[0][:, 0]
+    # b_ind2 = sort_qscheme(tensor1, coef)[1][:, 0]
+
+    b_ind1 = sort_qscheme(tensor1, coef)[0].tolist()
+    b_ind2 = sort_qscheme(tensor1, coef)[1].tolist()
+     
+    tensor_qs1 = tensor1[b_ind1, :, :, :]
+    tensor_qs2 = tensor1[b_ind2, :, :, :]
+
+    return tensor_qs1, tensor_qs2
+
+
+
+# # With Additive
+# def mixed_quant(tensor1, in_std_th): 
+
+#     w1=sep_wt_mod(tensor1, in_std_th)[0]
+#     w2=sep_wt_mod(tensor1, in_std_th)[1]
+#     otensor = torch.empty(tensor1.shape)
+
+#     qd1 = w1
+#     qd2 = w2
+
+   
+
+
+##########################################################################################################
+
+
+
+
+
+
+
+
 
 
 def uq_with_calibrated_graditens(grad_scale=None):
@@ -162,7 +231,7 @@ class QuantConv2d(nn.Conv2d):
     """
 
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1,
-                 bias=False, bit=5, power=True, additive=True, grad_scale=None):
+                 bias=False, bit=5, power=True, additive=False, grad_scale=None, percent=100):
         super(QuantConv2d, self).__init__(in_channels, out_channels, kernel_size, stride, padding, dilation, groups,
                                           bias)
         self.layer_type = 'QuantConv2d'
@@ -173,9 +242,33 @@ class QuantConv2d(nn.Conv2d):
             if self.bit > 2:
                 self.proj_set_weight = build_power_value(B=self.bit - 1, additive=additive)
             self.proj_set_act = build_power_value(B=self.bit, additive=additive)
-        self.act_alpha = torch.nn.Parameter(torch.tensor(6.0))
-        self.weight_alpha = torch.nn.Parameter(torch.tensor(3.0))
+        # self.act_alpha = torch.nn.Parameter(torch.tensor(6.0))
+        # self.weight_alpha = torch.nn.Parameter(torch.tensor(3.0))
+        self.act_alpha = torch.nn.Parameter(torch.tensor(6.0)).cuda()
+        self.weight_alpha = torch.nn.Parameter(torch.tensor(3.0)).cuda()
+        
 
+
+
+        self.weight.to('cuda:0')
+        self.weight = torch.nn.Parameter(self.weight.cuda())
+        self.perc=percent
+        self.pertocoef_dict = {"0":0.0, "10":0.1, "20":0.2, "30":0.3, "40":0.35,
+                                     "50":0.4, "60":0.5, "70":0.6, "80":0.7, "90":0.9,
+                                     "100":1.0,}
+        
+        self.coef = self.pertocoef_dict[f"{self.perc}"]
+        self.wgt2 = sep_wt_mod(self.weight, self.coef)[1]
+        self.idx2 = sort_qscheme(self.weight, self.coef)[1]
+
+        # print(f"wgt2 device: {self.wgt2.get_device()}")
+        # print(f"self weight device: {self.weight.get_device()}")
+        # self.wgt1, self.wgt2 = sep_wt_mod(self.weight, self.coef)
+        # self.idx1, self.idx2 = sort_qscheme(self.weight, self.coef)
+        # self.otensor = torch.empty(self.weight.shape)
+
+
+    ###### 위에서 분류한 Weight Tensor 1d Index에 따라, 해당하는 Filter만 POT4로 Quantize
     def forward(self, x):
         if self.bit == 32:
             return F.conv2d(x, self.weight, self.bias, self.stride,
@@ -183,13 +276,22 @@ class QuantConv2d(nn.Conv2d):
         # weight normalization
         mean = self.weight.mean()
         std = self.weight.std()
-        weight = self.weight.add(-mean).div(std)
+        weight = self.weight.add(-mean).div(std)  # Batch Norm?
         if self.power:
             if self.bit > 2:
-                weight = apot_quantization(weight, self.weight_alpha, self.proj_set_weight, True, self.grad_scale)
+                # weight = apot_quantization(weight, self.weight_alpha, self.proj_set_weight, True, self.grad_scale)
+
+                # self.wgt2 = apot_quantization(self.wgt2, self.weight_alpha, self.proj_set_weight, True, self.grad_scale)
+                # weight[self.idx2, :, :, :] = self.wgt2
+
+                weight[self.idx2, :, :, :] = apot_quantization(weight[self.idx2, :, :, :], self.weight_alpha, self.proj_set_weight, True, self.grad_scale)
+                       
             else:
                 weight = uq_with_calibrated_graditens(self.grad_scale)(weight, self.weight_alpha)
-            x = apot_quantization(x, self.act_alpha, self.proj_set_act, False, self.grad_scale)
+            
+            # Conv.Layer의 Input은 Fixed Point 32로 Quantization (INT로 해도 되긴 함)
+            # x = apot_quantization(x, self.act_alpha, self.proj_set_act, False, self.grad_scale)
+            x = uniform_quantization(x, self.act_alpha, self.bit, False, self.grad_scale)
         else:
             if self.bit > 2:
                 weight = uniform_quantization(weight, self.weight_alpha, self.bit, True, self.grad_scale)

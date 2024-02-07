@@ -25,6 +25,10 @@ from tensorboardX import SummaryWriter
 import sys
 import gc
 
+import wandb
+import numpy as np
+
+
 model_names = sorted(name for name in models.__dict__
                      if name.islower() and not name.startswith("__")
                      and callable(models.__dict__[name]))
@@ -42,10 +46,10 @@ parser.add_argument('-b', '--batch-size', default=1024, type=int,
                     help='mini-batch size (default: 256), this is the total '
                          'batch size of all GPUs on the current node when '
                          'using Data Parallel or Distributed Data Parallel')
-parser.add_argument('--bit', default=5, type=int, help='the bit-width of the quantized network')
-parser.add_argument('--data', metavar='DATA_PATH', default='./data/',
+parser.add_argument('--bit', default=4, type=int, help='the bit-width of the quantized network')
+parser.add_argument('--data', metavar='DATA_PATH', default='~/shared/Imagenet_data/',
                     help='path to imagenet data (default: ./data/)')
-parser.add_argument('--lr', '--learning-rate', default=0.01, type=float,
+parser.add_argument('--lr', '--learning-rate', default=1e-2, type=float,
                     metavar='LR', help='initial learning rate', dest='lr')
 parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                     help='momentum')
@@ -77,12 +81,53 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'N processes per node, which has N GPUs. This is the '
                          'fastest way to use PyTorch for either single node or '
                          'multi node data parallel training')
+parser.add_argument('--percentage', default=-100, type=int,
+                    help='bot std percentage of filters to quantize to po2 in each layer')
 
 best_acc1 = 0
 
 
+GPU_UUID_list = ["MIG-a2d6ade7-2495-5f5f-ba67-150f0038f7be", "MIG-975aecf0-aaec-5c79-a8bc-9b005ecd72dd",\
+ "MIG-62de5551-207b-5aa3-8ce2-51d7a95276b6", "MIG-43b6e1cb-c7ab-5311-87f1-3a0abaa7ec82",\
+ "MIG-2b9f5334-d823-56aa-85d3-83a0feef722b", "MIG-8c49a915-7cfb-5331-8e6c-77434700c634",\
+ "MIG-b670fdd7-3c7e-5ee7-826d-f4fbbc4d6369",\
+ \
+ "MIG-fd11dc37-b7f0-5b58-8f6c-1f1c8ab246cf", "MIG-3a6ee76b-0551-511d-ac62-c222282db8ea",\
+ "MIG-0cd2f85e-57fd-5d1c-849f-ffe0a84e10dd",\
+ \
+ "MIG-7c492f81-7d8e-5c27-8448-e8dd104e6dcb", "MIG-475a44c1-946f-51ba-a37e-c6f03a7d7eb0",\
+ \
+ "MIG-4d2d7c00-50b3-5e32-8e06-48e418e72ee8", "MIG-974c54a7-ee81-5fe6-999d-28227fff589a"]
+
+
+# os.environ["CUDA_VISIBLE_DEVICES"] = f"{GPU_UUID_list[0], GPU_UUID_list[1], GPU_UUID_list[2], GPU_UUID_list[3], GPU_UUID_list[4], GPU_UUID_list[5], GPU_UUID_list[6]}"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "GPU-7116f551-f1c3-2265-eb56-c90cd826ee1a"
+
+
+
+
+
+
+
 def main():
     args = parser.parse_args()
+
+    # project_name = f"apot_{args.arch}_bw{args.bit}_lr{args.lr}_bz{args.batch_size}_epochs{args.epochs}"
+    # wandb.init(project = project_name, entity = "piggybusuk",\
+    # name=f"{args.arch}\
+    # bw_{args.bit}_lr{args.lr}_batch{args.batch_size}"
+    # )
+    # wandb.config = {
+    #     "learning_rate": args.lr,
+    #     "batch_size": args.batch_size,
+    #     "train_epochs": args.epochs,
+    #     "Model_name": args.arch,
+    # }
+
+
+
+
+
 
     if args.seed is not None:
         random.seed(args.seed)
@@ -118,6 +163,7 @@ def main():
 
 def main_worker(gpu, ngpus_per_node, args):
     global best_acc1
+    global device
     args.gpu = gpu
 
     if args.gpu is not None:
@@ -134,7 +180,20 @@ def main_worker(gpu, ngpus_per_node, args):
                                 world_size=args.world_size, rank=args.rank)
     # create model
     print("=> creating model '{}'".format(args.arch))
-    model = models.__dict__[args.arch](pretrained=True, bit=args.bit)
+    # model = models.__dict__[args.arch](pretrained=True, bit=args.bit)
+
+    ############ args로 입력해준 std BOT perc%를 argument로 넣어서 model load
+    model = models.__dict__[args.arch](pretrained=True, bit=args.bit, percent=f"{args.percentage}")
+
+
+
+    # for k, v in model.__dict__.items():
+    #         if isinstance(v, torch.Tensor):
+    #             v.cuda()
+
+
+
+
 
     if args.distributed:
         # For multiprocessing distributed, DistributedDataParallel constructor
@@ -164,13 +223,66 @@ def main_worker(gpu, ngpus_per_node, args):
             model.cuda()
         else:
             model = torch.nn.DataParallel(model).cuda()
+            # model = torch.nn.DataParallel(model, device_ids=[1]).cuda()
+   
 
     # init from pre-trained model or full-precision model
     if args.pretrained:
         if os.path.isfile(args.pretrained):
             print("=> loading pre-trained model from {}".format(args.pretrained))
-            checkpoint = torch.load(args.pretrained)
+            print(f"cuda dev count: {torch.cuda.device_count()}")
+            model = torch.nn.DataParallel(model, device_ids=[args.gpu]).cuda()
+            checkpoint = torch.load(args.pretrained, map_location='cuda:0')
             model.load_state_dict(checkpoint['model'])
+   
+
+            # ############## apot 체크포인트 불러올때, module.module. key에러 뜨는 문제 해결
+
+            # state_dict = torch.load(args.pretrained, map_location='cuda:0')['state_dict']
+            # from collections import OrderedDict
+            # new_state_dict = OrderedDict()
+            # for k, v in state_dict.items():
+            #     name = k[7:] # remove `module.`
+            #     new_state_dict[name] = v
+
+            # model.load_state_dict(new_state_dict)
+
+
+
+            # ################### apot로 훈련되지 않아서, alpha가 없는 model을 불러올때
+            # # model.load_state_dict(checkpoint['model_state_dict'])
+            # # model.load_state_dict(checkpoint)
+
+            # # print(f"model_state_dict keys: {checkpoint['model_state_dict'].keys()}")
+
+            # # for key in list(checkpoint['model_state_dict'].keys()):
+            # for key in list(checkpoint['state_dict'].keys()):
+            #     if 'module.module.' not in key and 'module.' in key:
+            #         # checkpoint['model_state_dict'][key.replace(f"{key}", 'module.'.join(key))] = checkpoint['model_state_dict'][key]
+            #         # checkpoint['model_state_dict']['module.'.join(key)] = checkpoint['model_state_dict'][key]
+
+            #         # checkpoint['model_state_dict'].update({ f"module.{key}" : checkpoint['model_state_dict'][key] } )
+            #         # del checkpoint['model_state_dict'][key]
+
+            #         checkpoint['state_dict'].update({ f"module.{key}" : checkpoint['state_dict'][key] } )
+            #         del checkpoint['state_dict'][key]
+
+            #     # if 'layer' in key and 'conv' in key:
+            #     #     checkpoint['model_state_dict'].update({ f"module.{key.replace('weight', 'weight_alpha')}" : torch.nn.Parameter(torch.tensor(3.0)) } )
+            #     #     checkpoint['model_state_dict'].update({ f"module.{key.replace('weight', 'act_alpha')}" : torch.nn.Parameter(torch.tensor(6.0)) } )
+                
+            #     # if 'layer' in key and 'downsample' in key:
+            #     #     checkpoint['model_state_dict'].update({ f"module.{key.replace('weight', 'weight_alpha')}" : torch.nn.Parameter(torch.tensor(3.0)) } )
+            #     #     checkpoint['model_state_dict'].update({ f"module.{key.replace('weight', 'act_alpha')}" : torch.nn.Parameter(torch.tensor(6.0)) } )
+                
+
+            
+            # # print(f"New Keys: {checkpoint['model_state_dict'].keys()}")
+            # # model.load_state_dict(checkpoint['model_state_dict'])
+            # model.load_state_dict(checkpoint['state_dict'])
+
+
+            model.cuda()
             model.module.show_params()
         else:
             print('no pre-trained model found')
@@ -196,11 +308,26 @@ def main_worker(gpu, ngpus_per_node, args):
         if os.path.isfile(args.resume):
             print("=> loading checkpoint '{}'".format(args.resume))
             checkpoint = torch.load(args.resume)
+            # checkpoint = torch.load(args.resume, map_location='cuda:0')
             args.start_epoch = checkpoint['epoch']
             best_acc1 = checkpoint['best_acc1']
             if args.gpu is not None:
                 # best_acc1 may be from a checkpoint from a different GPU
                 best_acc1 = best_acc1.to(args.gpu)
+           
+           
+           ############ module.이 붙어서 저장된걸, 없는채로 load해야 하는 문제 해결
+           
+
+            for key in list(checkpoint['state_dict'].keys()):
+                if  'module.' not in key:
+                    checkpoint['state_dict'].update({ f"module.{key}" : checkpoint['state_dict'][key] } )
+                    del checkpoint['state_dict'][key]
+
+           
+           
+           
+           
             model.load_state_dict(checkpoint['state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer'])
             print("=> loaded checkpoint '{}' (epoch {})"
@@ -209,6 +336,19 @@ def main_worker(gpu, ngpus_per_node, args):
             print("=> no checkpoint found at '{}'".format(args.resume))
 
     cudnn.benchmark = True
+
+
+
+    # ################# (맨 아래 주석처리한 부분에 관련된 파트이므로 무시) pot quantization
+
+
+    # model.train()
+    # perc_in=args.percentage
+    # po2_quant(model, args.bit, args.percentage)
+    # print(f"pot{args.bit}  {perc_in}% custom pt quantization finished!")
+
+    # ################# (맨 아래 주석처리한 부분에 관련된 파트이므로 무시) 
+
 
     # data loader by official torchversion:
     # --------------------------------------------------------------------------
@@ -295,6 +435,9 @@ def train(train_loader, model, criterion, optimizer, epoch, args, writer):
 
     end = time.time()
     for i, (images, target) in enumerate(train_loader):
+
+        # wandb.watch(model, None, log="all", log_freq=10)
+
         # measure data loading time
         data_time.update(time.time() - end)
 
@@ -314,7 +457,8 @@ def train(train_loader, model, criterion, optimizer, epoch, args, writer):
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
-        loss.backward()
+        # loss.backward() # 원본
+        loss.backward(retain_graph=True) # ResNet에서 Mixed 했을때
         optimizer.step()
 
         # measure elapsed time
@@ -324,6 +468,10 @@ def train(train_loader, model, criterion, optimizer, epoch, args, writer):
         if i % args.print_freq == 0:
             progress.display(i)
         gc.collect()
+    
+    # wandb.log({"epoch": epoch, "train_accuracy": top1.avg})
+    
+    
     writer.add_scalar('train_acc', top1.avg, epoch)
 
 
@@ -343,6 +491,8 @@ def validate(val_loader, model, criterion, args):
     with torch.no_grad():
         end = time.time()
         for i, (images, target) in enumerate(val_loader):
+
+            
             if args.gpu is not None:
                 images = images.cuda(args.gpu, non_blocking=True)
             target = target.cuda(args.gpu, non_blocking=True)
@@ -364,10 +514,12 @@ def validate(val_loader, model, criterion, args):
             if i % args.print_freq == 0:
                 progress.display(i)
 
+        # wandb.log({"epoch": i, "test_accuracy": top1.avg})
+
         # TODO: this should also be done with the ProgressMeter
         print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
               .format(top1=top1, top5=top5))
-    model.module.show_params()
+    # model.module.show_params()
 
     return top1.avg
 
@@ -440,10 +592,239 @@ def accuracy(output, target, topk=(1,)):
 
         res = []
         for k in topk:
-            correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
+            # correct_k = correct[:k].view(-1).float().sum(0, keepdim=True)
+            correct_k = correct[:k].contiguous().view(-1).float().sum(0, keepdim=True)
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
 
 
 if __name__ == '__main__':
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ################### (폐기, quant_layer.py 및 resnet.py에서 구현함) Filter Wise Quantization을 구현하는 블록 시작
+    
+
+
+# def sort_qscheme(tensor1, coef):  ### index는 tensor로 나타냄 (수정후)
+       
+#     th = coef * ( torch.max(torch.std(tensor1, (1, 2, 3))).item() - torch.min(torch.std(tensor1, (1, 2, 3))).item()) + torch.min(torch.std(tensor1, (1, 2, 3))).item()
+#     qs1id = (torch.std(tensor1, (1, 2, 3)) > th).nonzero()
+#     qs2id = (torch.std(tensor1, (1, 2, 3)) <=th).nonzero()
+
+#     return qs1id , qs2id
+
+
+# def sep_wt_mod(tensor1, coef):   # for문 없애고
+
+#     # sort_qscheme에서 만든 index tensor 2개 쓰면 되지 않나?
+#     b_ind1 = sort_qscheme(tensor1, coef)[0][:, 0]
+#     b_ind2 = sort_qscheme(tensor1, coef)[1][:, 0]
+     
+#     tensor_qs1 = tensor1[b_ind1, :, :, :].to(device) 
+#     tensor_qs2 = tensor1[b_ind2, :, :, :].to(device) 
+
+#     return tensor_qs1, tensor_qs2
+
+
+
+
+# def gradient_scale(x, scale):
+#     yout = x
+#     ygrad = x * scale
+#     y = (yout - ygrad).detach() + ygrad
+#     return y
+
+
+# def uniform_quantization(tensor, alpha, bit, is_weight=True, grad_scale=None):
+#     if grad_scale:
+#         alpha = gradient_scale(alpha, grad_scale)
+#     data = tensor / alpha
+#     if is_weight:
+#         data = data.clamp(-1, 1)
+#         data = data * (2 ** (bit - 1) - 1)
+#         data_q = (data.round() - data).detach() + data
+#         data_q = data_q / (2 ** (bit - 1) - 1) * alpha
+#     else:
+#         data = data.clamp(0, 1)
+#         data = data * (2 ** bit - 1)
+#         data_q = (data.round() - data).detach() + data
+#         data_q = data_q / (2 ** bit - 1) * alpha
+#     return data_q
+
+
+
+# # With Additive
+# def build_power_value(B=2, additive=False):
+#     base_a = [0.]
+#     base_b = [0.]
+#     base_c = [0.]
+#     base_d = [0.] #내가 추가
+#     if additive:
+#         if B == 2:
+#             for i in range(3):
+#                 base_a.append(2 ** (-i - 1))
+#         elif B == 4:
+#             for i in range(3):
+#                 base_a.append(2 ** (-2 * i - 1))
+#                 base_b.append(2 ** (-2 * i - 2))
+#         elif B == 6:
+#             for i in range(3):
+#                 base_a.append(2 ** (-3 * i - 1))
+#                 base_b.append(2 ** (-3 * i - 2))
+#                 base_c.append(2 ** (-3 * i - 3))
+#         elif B == 3:
+#             for i in range(3):
+#                 if i < 2:
+#                     base_a.append(2 ** (-i - 1))
+#                 else:
+#                     base_b.append(2 ** (-i - 1))
+#                     base_a.append(2 ** (-i - 2))
+#         elif B == 5:
+#             for i in range(3):
+#                 if i < 2:
+#                     base_a.append(2 ** (-2 * i - 1))
+#                     base_b.append(2 ** (-2 * i - 2))
+#                 else:
+#                     base_c.append(2 ** (-2 * i - 1))
+#                     base_a.append(2 ** (-2 * i - 2))
+#                     base_b.append(2 ** (-2 * i - 3))
+        
+#         elif B == 7: #내가 추가
+#             for i in range(4):
+#                 if i<3:
+#                     base_a.append(2 ** (-3 * i - 1))
+#                     base_b.append(2 ** (-3 * i - 2))
+#                     base_c.append(2 ** (-3 * i - 3))
+                
+#                 else:
+#                     base_d.append(2 ** (-3 * 1 - 1))
+#                     base_a.append(2 ** (-3 * i - 2))
+#                     base_b.append(2 ** (-3 * i - 3))
+#                     base_c.append(2 ** (-3 * i - 4))
+
+#         else:
+#             pass
+#     else:
+#         for i in range(2 ** B - 1):
+#             base_a.append(2 ** (-i - 1))
+#     values = []
+#     for a in base_a:
+#         for b in base_b:
+#             for c in base_c:
+#                 values.append((a + b + c))
+#     values = torch.Tensor(list(set(values))).to(device) 
+#     values = values.mul(1.0 / torch.max(values))
+#     return values
+
+
+# # With Additive
+# def pot_quantization(tensor, alpha, proj_set, is_weight=True, grad_scale=None):
+#     def power_quant(x, value_s):
+#         if is_weight:
+#             shape = x.shape
+#             xhard = x.view(-1)
+#             sign = x.sign()
+#             value_s = value_s.type_as(x)
+#             xhard = xhard.abs()
+#             idxs = (xhard.unsqueeze(0) - value_s.unsqueeze(1)).abs().min(dim=0)[1]
+#             xhard = value_s[idxs].view(shape).mul(sign)
+#             xhard = xhard
+#         else:
+#             shape = x.shape
+#             xhard = x.view(-1)
+#             value_s = value_s.type_as(x)
+#             xhard = xhard
+#             idxs = (xhard.unsqueeze(0) - value_s.unsqueeze(1)).abs().min(dim=0)[1]
+#             xhard = value_s[idxs].view(shape)
+#             xhard = xhard
+#         xout = (xhard - x).detach() + x
+#         return xout
+
+#     if grad_scale:
+#         alpha = gradient_scale(alpha, grad_scale)
+#     data = tensor / alpha
+#     if is_weight:
+#         data = data.clamp(-1, 1)
+#         data_q = power_quant(data, proj_set)
+#         data_q = data_q * alpha
+#     else:
+#         data = data.clamp(0, 1)
+#         data_q = power_quant(data, proj_set)
+#         data_q = data_q * alpha
+#     return data_q
+
+# # With Additive
+# def mixed_quant(tensor1, in_std_th, coef_alph, fixed_point_num_total_bits=8,  fixed_point_num_fraction_bits=4, po2_num_total_bits=8, in_additive=False): 
+
+#     global acc_qs1 
+#     global acc_qs2
+
+#     w1=sep_wt_mod(tensor1, in_std_th)[0].to(device)
+#     w2=sep_wt_mod(tensor1, in_std_th)[1].to(device)
+#     otensor = torch.empty(tensor1.shape).to(device)
+
+#     weight_alpha = torch.nn.Parameter(torch.mul(torch.max(torch.abs(tensor1)).to(device), coef_alph))
+#     if (coef_alph==3.0):
+#         weight_alpha = torch.nn.Parameter(torch.tensor(3.0).to(device))
+
+#     proj_set = build_power_value(po2_num_total_bits-1, in_additive)
+
+ 
+#     qd1 = w1 
+#     qd2 = pot_quantization(w2, weight_alpha, proj_set, is_weight=True, grad_scale=None).to(device)
+
+#     # 합치는 파트
+#     bind1 = sort_qscheme(tensor1, in_std_th)[0][:, 0] 
+#     bind2 = sort_qscheme(tensor1, in_std_th)[1][:, 0] 
+#     # otensor[bind1, :, :, :] = qd1
+#     otensor[bind1, :, :, :] = w1
+#     otensor[bind2, :, :, :] = qd2
+
+#     return otensor
+
+
+# def po2_quant(in_model, po2_bits=4, perc=100):
+
+#     coeff = perc/100
+#     qs1_tot=0
+#     qs2_tot=0
+#     j0=0
+
+#     print(f"STD Bot {perc}%,  begin\n")
+
+#     for name, mod in in_model.named_modules():
+            
+#         if isinstance(mod, nn.Conv2d):
+            
+#             num_qs1 = torch.numel(sort_qscheme(mod.weight, coeff)[0])
+#             num_qs2 = torch.numel(sort_qscheme(mod.weight, coeff)[1])
+
+#             qs1_tot+=num_qs1
+#             qs2_tot+=num_qs2
+        
+#             mod.weight = torch.nn.Parameter(mixed_quant(mod.weight, coeff, torch.nn.Parameter(torch.tensor(3.0).to(device)), 8, 4, po2_bits, False))
+
+
+#             j0+=1
+
+    
+#     print(f"STD Bot {perc}%: POT {100*qs2_tot/(qs1_tot+qs2_tot)}%, FP32 {100*qs1_tot/(qs1_tot+qs2_tot)}%")
+    
+
+
+# ################### (폐기, quant_layer.py 및 resnet.py에서 구현함) Filter Wise Quantization을 구현하는 블록 끝
+
